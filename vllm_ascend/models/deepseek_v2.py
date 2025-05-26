@@ -25,11 +25,15 @@
 # # vllm-project/vllm/vllm/model_executor/models/deepseek_v2.py
 # """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
+from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch_npu
+import torchair
 import vllm.envs as envs
 from torch import nn
 from transformers import PretrainedConfig
@@ -68,9 +72,65 @@ from vllm.sequence import IntermediateTensors
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.utils import dispose_tensor
+from vllm_ascend.distributed.parallel_state import get_wp_group
+from vllm_ascend.model_executor.layers.linear import (
+    MergedColumnParallelLinearWp, RowParallelLinearWp)
+from torch.nn import functional as F
+from vllm.logger import logger
+@dataclass
+class DPMetadataForPadding:
+    cu_tokens_across_dp_cpu: torch.Tensor
+    lengths: torch.Tensor
+    max_length: int
+    pad_size: torch.Tensor
+    atten_unpad_mask: torch.Tensor
 
-VLLM_ENABLE_MC2: bool = envs_ascend.VLLM_ENABLE_MC2
+_dp_metadata_for_padding: Optional[DPMetadataForPadding] = None
 
+def padding_aligned_tp(dp_rank, data: torch.Tensor) -> torch.Tensor:
+
+
+    pad_size = _dp_metadata_for_padding.pad_size
+
+    if pad_size[dp_rank] == 0:
+        return data
+
+    return F.pad(data, (0, 0, 0, pad_size[dp_rank]))
+
+def padding_aligned_wp(data: torch.Tensor, is_prefill, layer_idx) -> torch.Tensor:
+
+    lengths = _dp_metadata_for_padding.lengths
+    max_length = _dp_metadata_for_padding.max_length
+
+    merged_data = torch.zeros((max_length*len(lengths), data.shape[1]), 
+                            dtype=data.dtype, device=data.device)
+    padded_starts = 0
+    current_pos = 0
+    for dp_rank in range(len(lengths)):
+        seq_len = lengths[dp_rank].item()
+        
+        merged_data[current_pos:current_pos + seq_len] = data[padded_starts:padded_starts + seq_len]
+        
+        current_pos += max_length
+        padded_starts += seq_len
+    return merged_data
+
+
+def unpadding_aligned_tp(padded_data: torch.Tensor) -> torch.Tensor:
+
+    atten_unpad_mask = _dp_metadata_for_padding.atten_unpad_mask
+    merged_data = padded_data[atten_unpad_mask, :]
+    return merged_data
+
+def unpadding_aligned_wp(dp_rank, padded_data: torch.Tensor) -> torch.Tensor:
+
+    lengths = _dp_metadata_for_padding.lengths
+    max_length = _dp_metadata_for_padding.max_length
+    seq_len = lengths[dp_rank].item()
+
+    padded_data = padded_data[max_length * dp_rank :max_length * dp_rank + seq_len]
+    return padded_data
 
 class CustomDeepseekV2MLP(nn.Module):
 
@@ -107,7 +167,7 @@ class CustomDeepseekV2MLP(nn.Module):
                 self.gate_up_proj.quant_method.quant_method,
                 AscendW8A8DynamicLinearMethod)
 
-    def forward(self, x):
+    def forward(self, x, is_prefill: bool = False, reduce_results: bool = True) -> torch.Tensor:
         if self.is_dynamic_quant:
             x, dynamic_scale = torch_npu.npu_dynamic_quant(x)
             x = torch_npu.npu_quant_matmul(
@@ -133,14 +193,82 @@ class CustomDeepseekV2MLP(nn.Module):
                 pertoken_scale=dynamic_scale,
                 output_dtype=torch.bfloat16,
             )
-            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
-                x = tensor_model_parallel_all_reduce(x)
+            if reduce_results and self.down_proj.tp_size > 1:
+               x = tensor_model_parallel_all_reduce(x)
             return x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
+class CustomDeepseekV2SharedExpertMLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinearWp(
+            hidden_size, [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj")
+        self.down_proj = RowParallelLinearWp(intermediate_size,
+                                           hidden_size,
+                                           bias=False,
+                                           quant_config=quant_config,
+                                           reduce_results=reduce_results,
+                                           prefix=f"{prefix}.down_proj")
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
+
+        # NOTE: `torch_npu.npu_dequant_swiglu_quant` can only be enabled in dynamic quant
+        self.is_dynamic_quant = not isinstance(
+            self.gate_up_proj.quant_method,
+            UnquantizedLinearMethod) and isinstance(
+                self.gate_up_proj.quant_method.quant_method,
+                AscendW8A8DynamicLinearMethod)
+
+    def forward(self, x, is_prefill: bool = False, reduce_results: bool = True) -> torch.Tensor:
+        if self.is_dynamic_quant:
+            x, dynamic_scale = torch_npu.npu_dynamic_quant(x)
+            x = torch_npu.npu_quant_matmul(
+                x,
+                self.gate_up_proj.weight,
+                self.gate_up_proj.weight_scale,
+                output_dtype=torch.int32,
+            )
+            x, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
+                x=x,
+                weight_scale=self.gate_up_proj.weight_scale_fp32,
+                activation_scale=dynamic_scale,
+                bias=None,
+                quant_scale=None,
+                quant_offset=None,
+                group_index=None,
+                activate_left=True,
+                quant_mode=1)
+            x = torch_npu.npu_quant_matmul(
+                x,
+                self.down_proj.weight,
+                self.down_proj.weight_scale,
+                pertoken_scale=dynamic_scale,
+                output_dtype=torch.bfloat16,
+            )
+            if reduce_results and self.down_proj.tp_size > 1:
+               x = tensor_model_parallel_all_reduce(x)
+            return x
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 class CustomDeepseekV2MoE(nn.Module):
 
@@ -195,79 +323,61 @@ class CustomDeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None:
             intermediate_size = (config.moe_intermediate_size *
                                  config.n_shared_experts)
-            self.shared_experts = CustomDeepseekV2MLP(
+            self.shared_experts = CustomDeepseekV2SharedExpertMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=True,
+                reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
         CustomDeepseekV2MoE.top_k = config.num_experts_per_tok
 
-        self.dp_size = get_dp_group().world_size
-
+        self.params_dtype = torch.get_default_dtype()
+        self.tp_rank_in_group = get_tp_group().rank_in_group
         self.tp_group = get_tp_group().device_group
-        self.tp_rank = get_tp_group().rank_in_group
+        self.dp_size = get_dp_group().world_size
+        self.enable_graph_mode = False
+        additional_config = get_current_vllm_config().additional_config
+        if additional_config:
+            self.enable_graph_mode = additional_config.get(
+                "enable_graph_mode", False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_metadata = get_forward_context().attn_metadata
-        # when profile runs, force experts to load balanced tokens
-        # to avoid high memory consumption on a single rank.
-        # TODO: need a better flag to indicate whether in profile run or not.
-        if attn_metadata is None:
-            # for profile run
-            is_prefill = True
-            enable_force_load_balance = True
-        else:
-            is_prefill = attn_metadata.num_prefills > 0
-            enable_force_load_balance = False
+    def forward(self,
+                hidden_states: torch.Tensor,
+                is_prefill: bool = False) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
+        # hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+        #                       MC2                      no mc2  
+        #  prefill_req    allreduce+allreduce      allreduce+allreduce 
+        #  decode_req     all_gather+allreduce      allreduce+allreduce
 
-        if self.tp_size > 1:
-            # pass
-            num_tokens, hidden_size = hidden_states.shape
-            if num_tokens < self.tp_size:
-                target_size = self.tp_size
-                new_hidden_states = torch.empty([target_size, hidden_size],
-                                                dtype=hidden_states.dtype,
-                                                device=hidden_states.device)
-                new_hidden_states[:num_tokens] = hidden_states
-                hidden_states = new_hidden_states
-            chunk_hidden_states = torch.tensor_split(hidden_states,
-                                                     self.tp_size,
-                                                     dim=0)
-            local_hidden_states = chunk_hidden_states[self.tp_rank]
+        if envs_ascend.VLLM_ENABLE_MC2 and not is_prefill and self.tp_size > 1:
+            chunks = torch.chunk(hidden_states, self.tp_size, dim=0)
+            hidden_states = chunks[self.tp_rank_in_group]
+
+        if self.dp_size > 1 and self.enable_graph_mode and not is_prefill:
+            stream_ctx = torchair.scope.npu_stream_switch(
+                "CustomDeepseekV2MoE_dp_graph_decode")
         else:
-            local_hidden_states = hidden_states
+            stream_ctx = nullcontext()
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(local_hidden_states)
+        with stream_ctx:
+            # router_logits: (num_tokens, n_experts)
+            # gating after all_gather
+            # router_logits, _ = self.gate(hidden_states)
 
-        router_hidden_states = self.experts(
-            hidden_states=local_hidden_states,
-            router_logits=router_logits,
-            is_prefill=is_prefill,
-            top_k=CustomDeepseekV2MoE.top_k,
-            enable_force_load_balance=enable_force_load_balance,
-        ) * self.routed_scaling_factor
+            hidden_states = self.experts(
+                hidden_states=hidden_states,
+                is_prefill=is_prefill,
+                top_k=CustomDeepseekV2MoE.top_k,
+                gate=self.gate) * self.routed_scaling_factor
 
-        if self.tp_size > 1:
-            dist.all_gather(list(chunk_hidden_states), router_hidden_states,
-                            self.tp_group)
-            final_hidden_states = torch.cat(chunk_hidden_states, dim=0)
-            if num_tokens < self.tp_size:
-                final_hidden_states = final_hidden_states[:num_tokens]
-        else:
-            final_hidden_states = router_hidden_states
 
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        
+        return hidden_states
 
 
 class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
@@ -344,10 +454,12 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj")
+        # all_reduce into function post-attention—process
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
                                         quant_config=quant_config,
+                                        reduce_results=False,
                                         prefix=f"{prefix}.o_proj")
 
         if rope_scaling:
@@ -460,6 +572,8 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
+        self.config = config
+        self.num_hidden_layers = config.num_hidden_layers
         # TODO: enable mla in vllm-ascend
         if model_config.use_mla:
             attn_cls = CustomDeepseekV2MLAAttention
@@ -482,15 +596,15 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-
-        if (config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0):
+        self.is_moe = config.n_routed_experts is not None and layer_idx >= config.first_k_dense_replace \
+                and layer_idx % config.moe_layer_freq == 0
+        if self.is_moe:
             self.mlp = CustomDeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+            self.shared_experts = self.mlp.shared_experts if config.n_shared_experts is not None else None
         else:
             self.mlp = CustomDeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -504,6 +618,95 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.tp_rank_in_group = get_tp_group().rank_in_group
+        self.tp_size = get_tp_group().world_size
+        self.dp_size = get_dp_group().world_size
+        self.dp_rank = (0 if self.dp_size == 1 else get_dp_group().rank_in_group)
+        self.enable_graph_mode = False
+        additional_config = get_current_vllm_config().additional_config
+        if additional_config:
+            self.enable_graph_mode = additional_config.get(
+                "enable_graph_mode", False)
+
+    def post_attention_process(self, hidden_states, residual, is_prefill):
+        if is_prefill or not self.enable_graph_mode:
+            if self.dp_size <= 1 or self.layer_idx < self.config.first_k_dense_replace:
+                hidden_states = get_tp_group().all_reduce(hidden_states)
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual)
+            else:
+                # padding hidden_states
+                hidden_states = padding_aligned_tp(self.dp_rank, hidden_states)
+                # RS hidden_states
+                hidden_states = dist._functional_collectives.reduce_scatter_tensor(
+                    hidden_states,
+                    "sum",
+                    scatter_dim=0,
+                    group=get_tp_group().device_group)
+                if self.layer_idx == self.config.first_k_dense_replace:
+                    # padding and slice residual
+                    reduce_scatter_tokens = hidden_states.size(0)
+                    residual = F.pad(residual, (0, 0, 0, reduce_scatter_tokens * self.tp_size - residual.size(0)))
+                    start = self.tp_rank_in_group * reduce_scatter_tokens
+                    residual = residual[start:start + reduce_scatter_tokens]
+                # post layernorm
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual)
+                # 全局 all_gather
+                hidden_states = get_wp_group().all_gather(hidden_states, 0)
+                # unpad
+                hidden_states = unpadding_aligned_tp(hidden_states)
+
+        else:
+            if self.tp_size > 1:
+                hidden_states = get_tp_group().all_reduce(hidden_states)
+            if self.enable_graph_mode and not envs_ascend.VLLM_ENABLE_MC2:
+                hidden_states = get_dp_group().all_gather(hidden_states, 0)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    def post_moe_process(self, shared_output, hidden_states, residual, is_prefill):
+        if is_prefill or not self.enable_graph_mode:
+            hidden_states = shared_output + hidden_states
+            if self.dp_size <= 1:
+                hidden_states = get_wp_group().all_reduce(hidden_states)
+                return hidden_states, None
+            hidden_states = padding_aligned_wp(hidden_states, is_prefill, self.layer_idx)
+
+            # RS hidden_states
+            hidden_states = dist._functional_collectives.reduce_scatter_tensor(
+                hidden_states,
+                "sum",
+                scatter_dim=0,  
+                group=get_wp_group().device_group)
+            # add residual
+            hidden_states = hidden_states + residual
+            residual = hidden_states
+            # 全局 all_gather
+            hidden_states = get_wp_group().all_gather(hidden_states, 0)
+            # unpad
+            hidden_states = unpadding_aligned_wp(self.dp_rank, hidden_states)
+            if self.layer_idx == self.num_hidden_layers - 1:
+                residual = None
+            return hidden_states, residual
+        else:
+            if envs_ascend.VLLM_ENABLE_MC2:
+                shared_output = self.shared_experts(hidden_states, is_prefill = False, reduce_results=True)
+                num_tokens, hidden_dim = hidden_states.shape
+                final_hidden_states = torch.zeros([num_tokens, hidden_dim],
+                                                dtype=self.params_dtype,
+                                                device="npu")
+                dist.all_gather_into_tensor(final_hidden_states, hidden_states,
+                                            self.tp_group)
+                hidden_states = final_hidden_states
+                hidden_states = shared_output + final_hidden_states
+                hidden_states = hidden_states + residual
+            else:
+                hidden_states = shared_output + hidden_states
+                hidden_states = get_wp_group().all_reduce(hidden_states)
+                hidden_states = hidden_states + residual
+            return hidden_states, None
+
 
     def forward(
         self,
@@ -512,14 +715,13 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         residual: Optional[torch.Tensor],
         kv_cache: Optional[torch.Tensor] = None,
         attn_metadata: Optional[AttentionMetadata] = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+        hidden_states = self.input_layernorm(hidden_states)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -538,10 +740,24 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 residual *= 1. / self.routed_scaling_factor
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.post_attention_process(hidden_states, residual, is_prefill)
+        if self.is_moe:
+            shared_output = None
+            if self.config.n_shared_experts is not None:
+                shared_output = self.shared_experts(hidden_states, is_prefill = is_prefill, reduce_results=False)
+            
+            hidden_states = self.mlp(hidden_states, is_prefill)
 
+            if shared_output is not None:
+                hidden_states = hidden_states + shared_output
+            
+            hidden_states, residual = self.post_moe_process(shared_output, hidden_states, residual, is_prefill)
+
+        else:
+            hidden_states = self.mlp(hidden_states, is_prefill)
+            hidden_states = hidden_states + residual
+            residual = None
+        
         if isinstance(
                 self.mlp,
                 CustomDeepseekV2MLP) and hidden_states.dtype == torch.float16:
@@ -553,7 +769,6 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             hidden_states *= 1. / self.routed_scaling_factor
 
         return hidden_states, residual
-
 
 class CustomDeepseekV2Model(nn.Module):
 
@@ -609,6 +824,7 @@ class CustomDeepseekV2Model(nn.Module):
         attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -627,7 +843,7 @@ class CustomDeepseekV2Model(nn.Module):
                 positions, hidden_states, residual,
                 kv_caches[i -
                           self.start_layer] if kv_caches is not None else None,
-                attn_metadata)
+                attn_metadata, is_prefill)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -635,7 +851,7 @@ class CustomDeepseekV2Model(nn.Module):
                 "residual": residual
             })
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -666,6 +882,14 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         self.sampler = get_sampler()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        self.dp_size = get_dp_group().world_size
+        self.dp_rank = (0 if self.dp_size == 1 else get_dp_group().rank_in_group)
+        self.tp_size = get_tp_group().world_size
+        self.enable_graph_mode = False
+        additional_config = get_current_vllm_config().additional_config
+        if additional_config:
+            self.enable_graph_mode = additional_config.get(
+                "enable_graph_mode", False)
 
     def forward(
         self,
@@ -675,10 +899,31 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if is_prefill or not self.enable_graph_mode:
+            cu_tokens_across_dp_cpu = get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
+            # get padding data
+            lengths = torch.cat([cu_tokens_across_dp_cpu[:1], cu_tokens_across_dp_cpu[1:] - cu_tokens_across_dp_cpu[:-1]])
+            max_length = lengths.max().item()
+            max_length = ((max_length + self.tp_size - 1) // self.tp_size) * self.tp_size
+            pad_size = -(lengths - max_length)
+
+            # 生成索引掩码（核心优化）
+            
+            group_indices = torch.arange(self.dp_size)
+            position_matrix = torch.arange(max_length).expand(self.dp_size, max_length)
+            lengths_tensor = lengths.view(-1, 1)
+            atten_unpad_mask = (position_matrix < lengths_tensor).view(-1).to("npu", non_blocking=True)
+
+            global _dp_metadata_for_padding
+            _dp_metadata_for_padding = DPMetadataForPadding(cu_tokens_across_dp_cpu, lengths, max_length, pad_size, atten_unpad_mask)
+
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,
-                                   inputs_embeds)
+                                   inputs_embeds, is_prefill)
+        if is_prefill or not self.enable_graph_mode:
+            del atten_unpad_mask
         return hidden_states
 
 
