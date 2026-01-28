@@ -45,7 +45,7 @@ aisbench_cases0 = [{
     "dataset_conf": "gsm8k/gsm8k_gen_0_shot_cot_str_perf",
     "num_prompts": 210,
     "max_out_len": 1500,
-    "batch_size": 18,
+    "batch_size": 20,
     "baseline": 1,
     "threshold": 0.97
 }]
