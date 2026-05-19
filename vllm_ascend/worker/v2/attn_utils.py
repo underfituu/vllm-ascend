@@ -23,6 +23,9 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, KVCacheConfig
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -145,6 +148,17 @@ def build_attn_state(
     # splitfuse
     elif vllm_config.scheduler_config.enable_chunked_prefill:
         attn_state = AscendAttentionState.ChunkedPrefill
+        # TRACE [attn_state v2]: build_attn_state 独立函数版本（v2 worker 路径）。
+        # 判断逻辑与 model_runner_v1._get_attn_state() 完全一致。
+        # 进入 ChunkedPrefill 的条件：enable_chunked_prefill=True，且
+        # 不是全 1（那是 DecodeOnly），也不是全新 prefill（那是 PrefillNoCache）。
+        logger.debug(
+            "[CHUNKED_PREFILL_TRACE] attn_utils.build_attn_metadata() | "
+            "attn_state=ChunkedPrefill, num_reqs=%d, "
+            "num_scheduled_tokens=%s, num_valid_tokens=%s",
+            len(num_scheduled_tokens), num_scheduled_tokens.tolist(),
+            num_valid_tokens.tolist(),
+        )
     else:
         attn_state = AscendAttentionState.PrefillCacheHit
     return attn_state

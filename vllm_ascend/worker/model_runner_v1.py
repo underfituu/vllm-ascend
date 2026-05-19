@@ -865,6 +865,22 @@ class NPUModelRunner(GPUModelRunner):
         # splitfuse
         elif self.scheduler_config.enable_chunked_prefill:
             attn_state = AscendAttentionState.ChunkedPrefill
+            # TRACE [attn_state]: 当 enable_chunked_prefill=True 且请求混合了
+            # 不同长度的 scheduled_tokens 时，进入 ChunkedPrefill 状态。
+            # 这个状态会影响下游 attention backend 的计算路径选择。
+            # 示例（2980-token 请求的 3 个 chunk）：
+            #   chunk1: num_reqs=1, num_scheduled_tokens=[1024] → ChunkedPrefill
+            #   chunk3: num_reqs=1, num_scheduled_tokens=[932]  → ChunkedPrefill
+            # 示例（decode 阶段，所有请求 scheduled=1）：
+            #   → 走上面 np.all(num_scheduled_tokens==1) 分支，变为 DecodeOnly
+            #   这个分支不会触发本打点。
+            logger.debug(
+                "[CHUNKED_PREFILL_TRACE] ModelRunner._get_attn_state() | "
+                "attn_state=ChunkedPrefill, num_reqs=%d, "
+                "num_scheduled_tokens=%s, num_valid_tokens=%s",
+                len(num_scheduled_tokens), num_scheduled_tokens.tolist(),
+                num_valid_tokens.tolist(),
+            )
         else:
             attn_state = AscendAttentionState.PrefillCacheHit
 

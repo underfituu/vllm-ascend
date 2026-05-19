@@ -22,6 +22,9 @@ import torch
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
@@ -274,6 +277,21 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
             common_attn_metadata, decode_threshold=self.decode_threshold
+        )
+        # TRACE [split]: Ascend Attention Backend 的 decode/prefill 分割点。
+        # split_decodes_and_prefills() 根据 query_start_loc 计算每个请求的 query 长度，
+        # 长度 <= decode_threshold 的视为 decode，否则视为 prefill。
+        # 在 chunked prefill 混合 batch 中，这决定了 decode 和 prefill 的 tensor 切分边界。
+        # 注意：Qwen3-0.6B 不走 AscendAttentionMetadataBuilder（而是 GDN builder），
+        # 此打点仅在使用 AscendAttentionBackendV1 的模型中触发。
+        logger.debug(
+            "[CHUNKED_PREFILL_TRACE] AscendAttentionMetadataBuilder.build() | "
+            "num_decodes=%d, num_prefills=%d, "
+            "num_decode_tokens=%d, num_prefill_tokens=%d, "
+            "num_actual_tokens=%d",
+            num_decodes, num_prefills,
+            num_decode_tokens, num_prefill_tokens,
+            num_actual_tokens,
         )
 
         block_table = common_attn_metadata.block_table_tensor
@@ -1192,6 +1210,18 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         num_decodes = attn_metadata.num_decodes
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         num_tokens = int(actual_seq_qlen[-1])  # type: ignore[index]
+        # TRACE [c8_chunked_prefill]: C8 INT8 量化模型专用的 chunked prefill 前向。
+        # 在混合 batch 中，query tensor 的前 num_decode_tokens 行给 decode（BNSD paged INT8），
+        # 后面 (num_tokens - num_decode_tokens) 行给 prefill（TND float）。
+        # split_boundary = num_decode_tokens 就是切分边界。
+        # 注意：Qwen3-0.6B 是 float 模型，不走此路径，此打点仅对 INT8 量化模型生效。
+        logger.debug(
+            "[CHUNKED_PREFILL_TRACE] _forward_c8_chunked_prefill() | "
+            "query.shape=%s, num_decode_tokens=%d, num_decodes=%d, "
+            "num_prefills=%d, num_tokens=%d, split_boundary=%d",
+            list(query.shape), num_decode_tokens, num_decodes,
+            attn_metadata.num_prefills, num_tokens, num_decode_tokens,
+        )
 
         if num_decode_tokens > 0:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]

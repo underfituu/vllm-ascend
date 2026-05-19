@@ -168,11 +168,26 @@ class SchedulerDynamicBatch(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        raw_budget = token_budget
         token_budget = self.budget_refiner.refine_budget(self.running, token_budget)
+        # TRACE [entry]: Ascend 动态批调度器入口。
+        # 与上游 Scheduler 的关键差异：budget 会经过 BudgetRefiner 动态调整。
+        # BudgetRefiner 根据当前 running 中 decode 请求的平均 context 长度和数量，
+        # 从 profile_table.csv 查表得到最优 chunk_size 作为 refined_budget。
+        # 当没有 profile_table 或无 decode 请求时，退化为 raw_budget（=max_num_batched_tokens=1024）。
+        # 示例：raw_budget=1024, 无 decode 请求 → refined_budget=1024（无变化）
+        logger.debug(
+            "[CHUNKED_PREFILL_TRACE] SchedulerDynamicBatch.schedule() entry | "
+            "raw_budget=%d, refined_budget=%d, num_running=%d, num_waiting=%d",
+            raw_budget, token_budget, len(self.running), len(self.waiting),
+        )
 
         # NOTE: We move the prefill requests to the end of the self.running
         # list and keep the relative order unchanged. This rearrangement makes this
         # scheduling algorithm a strict decode-first chunked prefills.
+        # TRACE [decode-first]: Ascend 的调度策略是严格的 "decode-first chunked prefill"：
+        # 先把 decode 请求排前面优先调度，prefill 请求排后面，确保 decode 延迟最低。
+        # 上游 Scheduler 没有这个重排，是纯 FCFS。
         d_lst = [req for req in self.running if req.num_computed_tokens >= req.num_prompt_tokens]
         p_lst = [req for req in self.running if req.num_computed_tokens < req.num_prompt_tokens]
         self.running = d_lst + p_lst
@@ -196,7 +211,21 @@ class SchedulerDynamicBatch(Scheduler):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens_before_clamp = num_new_tokens
             num_new_tokens = min(num_new_tokens, token_budget)
+            # TRACE [running]: 与上游 Scheduler 逻辑一致的 token 截断。
+            # 但因为 decode-first 排序，decode 请求总是先消耗 budget，
+            # 留给 prefill 续传的 budget 可能已被 decode 请求占用。
+            # 这是 Ascend 调度与上游的核心差异之一：
+            # 上游 FCFS 按入队顺序分配 budget，Ascend 则优先保障 decode 延迟。
+            logger.debug(
+                "[CHUNKED_PREFILL_TRACE] SchedulerDynamicBatch.schedule() running | "
+                "req_id=%s, num_computed=%d, num_tokens=%d, "
+                "num_new_tokens_raw=%d, num_new_tokens_clamped=%d, token_budget_before=%d",
+                request.request_id, request.num_computed_tokens,
+                request.num_tokens_with_spec,
+                num_new_tokens_before_clamp, num_new_tokens, token_budget,
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -404,7 +433,25 @@ class SchedulerDynamicBatch(Scheduler):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
+                    num_new_tokens_before_clamp_w = num_new_tokens
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    # TRACE [waiting]: 与上游 Scheduler.waiting 逻辑一致的切刀位置。
+                    # Ascend 动态批的差异点：
+                    #   1. token_budget 可能已被 BudgetRefiner 动态调整（基于 profile_table 查表）
+                    #   2. 由于 decode-first，到达此处时 budget 已被 decode 请求消耗过
+                    #   3. 超 budget 时不 break 而是 skip+continue（上游是 break），
+                    #      这意味着 Ascend 会尝试调度更多小请求填满 budget。
+                    logger.debug(
+                        "[CHUNKED_PREFILL_TRACE] SchedulerDynamicBatch.schedule() waiting | "
+                        "req_id=%s, num_computed=%d, num_tokens=%d, "
+                        "num_new_tokens_raw=%d, num_new_tokens_clamped=%d, "
+                        "is_chunked=%s, token_budget_before=%d",
+                        request.request_id, num_computed_tokens,
+                        request.num_tokens,
+                        num_new_tokens_before_clamp_w, num_new_tokens,
+                        num_new_tokens < num_new_tokens_before_clamp_w,
+                        token_budget,
+                    )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
