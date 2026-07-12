@@ -1,8 +1,11 @@
 # Standard
+import ctypes
 import functools
+import hashlib
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +25,114 @@ from vllm_ascend.distributed.parallel_state import get_global_rank
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
+_DEFAULT_BATCH_CAPTURE_DIRNAME = "mooncake_batch_capture"
+_BATCH_CAPTURE_ENABLE_ENV = "MOONCAKE_BATCH_CAPTURE"
+_BATCH_CAPTURE_DIR_ENV = "MOONCAKE_BATCH_CAPTURE_DIR"
+_ACL_MEMCPY_DEVICE_TO_HOST = 2
+
+
+def _batch_capture_root_dir() -> str | None:
+    configured_dir = os.getenv(_BATCH_CAPTURE_DIR_ENV)
+    if configured_dir:
+        return configured_dir
+    if os.getenv(_BATCH_CAPTURE_ENABLE_ENV, "0") == "1":
+        return os.path.join(os.getcwd(), _DEFAULT_BATCH_CAPTURE_DIRNAME)
+    return None
+
+
+def _read_device_buffer_bytes(addr: int, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    try:
+        from acl.rt import memcpy  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "acl.rt.memcpy is required to capture Mooncake batch payloads on Ascend."
+        ) from exc
+
+    host_buffer = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
+    host_ptr = host_buffer.data_ptr()
+    memcpy(host_ptr, host_ptr + size * 2, int(addr), size, _ACL_MEMCPY_DEVICE_TO_HOST)
+    return ctypes.string_at(host_ptr, size)
+
+
+def _capture_payloads(addrs: list[list[int]], sizes: list[list[int]]) -> list[bytes]:
+    payloads: list[bytes] = []
+    for item_addrs, item_sizes in zip(addrs, sizes, strict=True):
+        merged = bytearray()
+        for addr, size in zip(item_addrs, item_sizes, strict=True):
+            merged.extend(_read_device_buffer_bytes(int(addr), int(size)))
+        payloads.append(bytes(merged))
+    return payloads
+
+
+def _write_batch_capture(
+    operation: str,
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+    duration_seconds: float,
+    result: list[int] | None,
+    error: str | None = None,
+) -> str | None:
+    capture_root = _batch_capture_root_dir()
+    if capture_root is None:
+        return None
+
+    operation_dir = os.path.join(capture_root, operation)
+    os.makedirs(operation_dir, exist_ok=True)
+
+    capture_id = f"{operation}_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
+    payloads = _capture_payloads(addrs, sizes)
+    items: list[dict[str, Any]] = []
+    for index, (key, item_addrs, item_sizes, payload) in enumerate(zip(keys, addrs, sizes, payloads, strict=True)):
+        payload_name = f"{capture_id}_item_{index:06d}.bin"
+        payload_path = os.path.join(operation_dir, payload_name)
+        with open(payload_path, "wb") as payload_file:
+            payload_file.write(payload)
+        items.append(
+            {
+                "index": index,
+                "key": key,
+                "addrs": [int(addr) for addr in item_addrs],
+                "sizes": [int(size) for size in item_sizes],
+                "payload_file": payload_name,
+                "payload_bytes": len(payload),
+                "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+
+    manifest = {
+        "capture_id": capture_id,
+        "operation": operation,
+        "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_seconds": duration_seconds,
+        "key_count": len(keys),
+        "result": result,
+        "error": error,
+        "items": items,
+    }
+    manifest_path = os.path.join(operation_dir, f"{capture_id}.json")
+    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2, ensure_ascii=False)
+
+    index_path = os.path.join(capture_root, "index.jsonl")
+    with open(index_path, "a", encoding="utf-8") as index_file:
+        index_file.write(
+            json.dumps(
+                {
+                    "capture_id": capture_id,
+                    "operation": operation,
+                    "manifest_path": manifest_path,
+                    "duration_seconds": duration_seconds,
+                    "key_count": len(keys),
+                    "error": error,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+    return manifest_path
 
 
 @functools.lru_cache(maxsize=1)
@@ -60,7 +171,7 @@ def _ssd_setup_kwargs(config: "MooncakeStoreConfig") -> dict[str, object]:
 
 
 class MooncakeBackend(Backend):
-    def __init__(self, parallel_config: ParallelConfig, lazy_init: bool = False):
+    def __init__(self, parallel_config: ParallelConfig, lazy_init: bool = False, contribute_memory: bool = True):
         self.parallel_config = parallel_config
         self.config = MooncakeStoreConfig.load_from_env()
         if self.config.protocol != "ascend":
@@ -70,6 +181,7 @@ class MooncakeBackend(Backend):
         self.local_seg: str | None = None
         self._use_fabric_mem = os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1"
         self._lazy_init = lazy_init and self._use_fabric_mem
+        self._contribute_memory = contribute_memory
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
 
@@ -102,9 +214,18 @@ class MooncakeBackend(Backend):
         store = MooncakeDistributedStore()
         local_hostname = get_ip()
         ssd_kwargs = _ssd_setup_kwargs(self.config)
+        # Scheduler-only clients (contribute_memory=False) do not contribute
+        # KV cache memory and therefore do not need SSD offload. Passing
+        # enable_ssd_offload=True for them would cause Mooncake to register
+        # an extra active client on the master, inflating both the client
+        # count and the reported SSD storage usage.
+        if ssd_kwargs and not self._contribute_memory:
+            ssd_kwargs = {}
+        # Each rank that contributes memory to the pool uses its own SSD
+        # directory to avoid bucket file collisions. Key by the globally unique
+        # rank so that DP/TP/PP/CP replicas never share a directory (dense and
+        # MoE alike); only ranks that contribute memory need an offload dir.
         if ssd_kwargs and ssd_kwargs.get("ssd_offload_path"):
-            # Per-rank SSD directory keyed by the globally unique rank so that
-            # DP/TP/PP/CP replicas never share a directory (dense and MoE alike).
             global_rank = get_global_rank(self.parallel_config)
             rank_path = os.path.join(str(ssd_kwargs["ssd_offload_path"]), f"rank_{global_rank}")
             try:
@@ -121,8 +242,8 @@ class MooncakeBackend(Backend):
             ret = store.setup(
                 local_hostname=self.local_seg,
                 metadata_server=self.config.metadata_server,
-                global_segment_size=self.config.global_segment_size,
-                local_buffer_size=self.config.local_buffer_size,
+                global_segment_size=self.config.global_segment_size if self._contribute_memory else 0,
+                local_buffer_size=self.config.local_buffer_size if self._contribute_memory else 0,
                 protocol=self.config.protocol,
                 rdma_devices=self.config.device_name,
                 master_server_addr=self.config.master_server_address,
@@ -134,7 +255,7 @@ class MooncakeBackend(Backend):
             ret = store.setup(
                 local_hostname=self.local_seg,
                 metadata_server=self.config.metadata_server,
-                global_segment_size=self.config.global_segment_size,
+                global_segment_size=self.config.global_segment_size if self._contribute_memory else 0,
                 local_buffer_size=0,
                 protocol=self.config.protocol,
                 rdma_devices=self.config.device_name,
@@ -156,6 +277,11 @@ class MooncakeBackend(Backend):
                 self.config.ssd_offload_path,
             )
         return store
+
+    @classmethod
+    def create_scheduler_client(cls, parallel_config: ParallelConfig):
+        torch.npu.set_device(0)
+        return cls(parallel_config, contribute_memory=False)
 
     def set_device(self):
         local_rank = get_world_group().local_rank
@@ -179,6 +305,9 @@ class MooncakeBackend(Backend):
         return self.store.batch_is_exist(keys)
 
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        start_time = time.perf_counter()
+        capture_error: str | None = None
+        capture_manifest_path: str | None = None
         try:
             self._ensure_initialized()
             assert self.store is not None
@@ -187,8 +316,27 @@ class MooncakeBackend(Backend):
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            duration_seconds = time.perf_counter() - start_time
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
+            try:
+                capture_manifest_path = _write_batch_capture(
+                    "put",
+                    keys,
+                    addrs,
+                    sizes,
+                    duration_seconds,
+                    [int(value) for value in res],
+                )
+            except Exception as capture_exc:
+                capture_error = f"{type(capture_exc).__name__}: {capture_exc}"
+                logger.warning("Failed to capture Mooncake put batch payloads: %s", capture_error)
+            logger.info(
+                "Mooncake batch_put_from_multi_buffers finished: key_count=%d duration_ms=%.3f capture=%s",
+                len(keys),
+                duration_seconds * 1000,
+                capture_manifest_path or "disabled",
+            )
             if failed_count:
                 error_codes = sorted(set(failed_codes))
                 logger.error(
@@ -201,6 +349,7 @@ class MooncakeBackend(Backend):
                 if self._lazy_init:
                     logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
         except Exception as e:
+            duration_seconds = time.perf_counter() - start_time
             logger.error(
                 "Failed to put %d keys out of %d. Check store state and memory.",
                 len(keys),
@@ -211,6 +360,25 @@ class MooncakeBackend(Backend):
                 keys,
                 type(e).__name__,
                 e,
+            )
+            try:
+                capture_manifest_path = _write_batch_capture(
+                    "put",
+                    keys,
+                    addrs,
+                    sizes,
+                    duration_seconds,
+                    result=None,
+                    error=f"{type(e).__name__}: {e}",
+                )
+            except Exception as capture_exc:
+                capture_error = f"{type(capture_exc).__name__}: {capture_exc}"
+                logger.warning("Failed to capture Mooncake put batch payloads after exception: %s", capture_error)
+            logger.info(
+                "Mooncake batch_put_from_multi_buffers failed: key_count=%d duration_ms=%.3f capture=%s",
+                len(keys),
+                duration_seconds * 1000,
+                capture_manifest_path or capture_error or "disabled",
             )
             if self._lazy_init:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
@@ -231,12 +399,34 @@ class MooncakeBackend(Backend):
             len(keys),
             keys[:3],
         )
+        start_time = time.perf_counter()
+        capture_error: str | None = None
+        capture_manifest_path: str | None = None
         try:
             res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            duration_seconds = time.perf_counter() - start_time
             res_list = list(res)
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)
             error_codes = sorted(set(failed_codes))
+            try:
+                capture_manifest_path = _write_batch_capture(
+                    "get",
+                    keys,
+                    addrs,
+                    sizes,
+                    duration_seconds,
+                    [int(value) for value in res_list],
+                )
+            except Exception as capture_exc:
+                capture_error = f"{type(capture_exc).__name__}: {capture_exc}"
+                logger.warning("Failed to capture Mooncake get batch payloads: %s", capture_error)
+            logger.info(
+                "Mooncake batch_get_into_multi_buffers finished: key_count=%d duration_ms=%.3f capture=%s",
+                len(keys),
+                duration_seconds * 1000,
+                capture_manifest_path or "disabled",
+            )
             if failed_count:
                 logger.error(
                     "Failed to get %d keys out of %d. error_codes=%s. Check key existence and memory state.",
@@ -250,6 +440,7 @@ class MooncakeBackend(Backend):
                     res_list[i] = 0
             return res_list
         except Exception as e:
+            duration_seconds = time.perf_counter() - start_time
             logger.error(
                 "Failed to get %d keys out of %d. Check store state and network.",
                 len(keys),
@@ -260,6 +451,25 @@ class MooncakeBackend(Backend):
                 keys,
                 type(e).__name__,
                 e,
+            )
+            try:
+                capture_manifest_path = _write_batch_capture(
+                    "get",
+                    keys,
+                    addrs,
+                    sizes,
+                    duration_seconds,
+                    result=None,
+                    error=f"{type(e).__name__}: {e}",
+                )
+            except Exception as capture_exc:
+                capture_error = f"{type(capture_exc).__name__}: {capture_exc}"
+                logger.warning("Failed to capture Mooncake get batch payloads after exception: %s", capture_error)
+            logger.info(
+                "Mooncake batch_get_into_multi_buffers failed: key_count=%d duration_ms=%.3f capture=%s",
+                len(keys),
+                duration_seconds * 1000,
+                capture_manifest_path or capture_error or "disabled",
             )
             return None
 
