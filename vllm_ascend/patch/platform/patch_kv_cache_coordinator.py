@@ -8,6 +8,7 @@ import vllm
 import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.mamba_mtp_debug import debug_enabled, debug_log
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     KVCacheCoordinator,
@@ -316,6 +317,25 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     pcp_world_size=self.pcp_world_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * effective_block_size
+                if debug_enabled():
+                    debug_log(
+                        "ascend_hybrid_cache_hit_group",
+                        coordinator_type=type(self).__name__,
+                        lookup_mode="all_groups",
+                        group_idx=idx,
+                        group_ids=group_ids,
+                        spec_type=type(spec).__name__,
+                        max_cache_hit_length=max_cache_hit_length,
+                        input_hit_length=hit_length,
+                        curr_hit_length_before=curr_hit_length,
+                        lookup_max_length=_max_length,
+                        new_hit_length=_new_hit_length,
+                        effective_block_size=effective_block_size,
+                        lcm_block_size=self.lcm_block_size,
+                        drop_eagle_block=use_eagle,
+                        eagle_verified=sorted(eagle_verified),
+                        hit_block_lens=[len(blocks) for blocks in hit_blocks],
+                    )
                 if use_eagle:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -346,6 +366,28 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
 
+        if debug_enabled():
+            debug_log(
+                "ascend_hybrid_cache_hit_final",
+                coordinator_type=type(self).__name__,
+                lookup_mode="all_groups",
+                max_cache_hit_length=max_cache_hit_length,
+                final_hit_length=hit_length,
+                group_block_lens=[
+                    len(blocks) if blocks is not None else 0
+                    for blocks in hit_blocks_by_group
+                ],
+                attention_groups=[
+                    {
+                        "spec_type": type(spec).__name__,
+                        "group_ids": group_ids,
+                        "eagle_group": idx in self.eagle_attn_group_indices,
+                    }
+                    for idx, (spec, group_ids, _) in enumerate(
+                        self.attention_groups
+                    )
+                ],
+            )
         return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
 
     def find_longest_cache_hit_per_group(
@@ -387,6 +429,17 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     if hit_blocks_by_group[group_ids[0]] is None:
                         for gid in group_ids:
                             hit_blocks_by_group[gid] = []
+                    if debug_enabled():
+                        debug_log(
+                            "ascend_hybrid_cache_hit_mamba_skipped",
+                            coordinator_type=type(self).__name__,
+                            lookup_mode="per_group",
+                            group_idx=idx,
+                            group_ids=group_ids,
+                            max_cache_hit_length=max_cache_hit_length,
+                            input_hit_length=hit_length,
+                            curr_hit_length=curr_hit_length,
+                        )
                     continue
 
                 effective_block_size = self._get_effective_block_size(spec)
@@ -418,6 +471,25 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     pcp_world_size=self.pcp_world_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * effective_block_size
+                if debug_enabled():
+                    debug_log(
+                        "ascend_hybrid_cache_hit_group",
+                        coordinator_type=type(self).__name__,
+                        lookup_mode="per_group",
+                        group_idx=idx,
+                        group_ids=group_ids,
+                        spec_type=type(spec).__name__,
+                        max_cache_hit_length=max_cache_hit_length,
+                        input_hit_length=hit_length,
+                        curr_hit_length_before=curr_hit_length,
+                        lookup_max_length=_max_length,
+                        new_hit_length=_new_hit_length,
+                        effective_block_size=effective_block_size,
+                        lcm_block_size=self.lcm_block_size,
+                        drop_eagle_block=use_eagle,
+                        eagle_verified=sorted(eagle_verified),
+                        hit_block_lens=[len(blocks) for blocks in hit_blocks],
+                    )
                 if use_eagle:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -448,6 +520,29 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
 
+        if debug_enabled():
+            debug_log(
+                "ascend_hybrid_cache_hit_final",
+                coordinator_type=type(self).__name__,
+                lookup_mode="per_group",
+                max_cache_hit_length=max_cache_hit_length,
+                final_hit_length=hit_length,
+                group_block_lens=[
+                    len(blocks) if blocks is not None else 0
+                    for blocks in hit_blocks_by_group
+                ],
+                attention_groups=[
+                    {
+                        "spec_type": type(spec).__name__,
+                        "group_ids": group_ids,
+                        "eagle_group": idx in self.eagle_attn_group_indices,
+                        "mamba_skipped": isinstance(spec, MambaSpec),
+                    }
+                    for idx, (spec, group_ids, _) in enumerate(
+                        self.attention_groups
+                    )
+                ],
+            )
         return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
 
 
