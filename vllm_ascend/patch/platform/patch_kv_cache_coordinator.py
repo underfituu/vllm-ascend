@@ -317,6 +317,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     pcp_world_size=self.pcp_world_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * effective_block_size
+                accepted_hit_length = min(curr_hit_length, _new_hit_length)
                 if debug_enabled():
                     debug_log(
                         "ascend_hybrid_cache_hit_group",
@@ -330,12 +331,37 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         curr_hit_length_before=curr_hit_length,
                         lookup_max_length=_max_length,
                         new_hit_length=_new_hit_length,
+                        accepted_hit_length=accepted_hit_length,
+                        expanded_hit_length_by=max(
+                            0, _new_hit_length - curr_hit_length
+                        ),
                         effective_block_size=effective_block_size,
                         lcm_block_size=self.lcm_block_size,
                         drop_eagle_block=use_eagle,
                         eagle_verified=sorted(eagle_verified),
                         hit_block_lens=[len(blocks) for blocks in hit_blocks],
                     )
+                    if _new_hit_length > curr_hit_length:
+                        debug_log(
+                            "ascend_hybrid_cache_hit_length_expanded",
+                            coordinator_type=type(self).__name__,
+                            lookup_mode="all_groups",
+                            group_idx=idx,
+                            group_ids=group_ids,
+                            spec_type=type(spec).__name__,
+                            max_cache_hit_length=max_cache_hit_length,
+                            input_hit_length=hit_length,
+                            curr_hit_length_before=curr_hit_length,
+                            lookup_max_length=_max_length,
+                            raw_hit_length=_new_hit_length,
+                            accepted_hit_length=accepted_hit_length,
+                            expanded_hit_length_by=_new_hit_length - curr_hit_length,
+                            effective_block_size=effective_block_size,
+                            lcm_block_size=self.lcm_block_size,
+                            drop_eagle_block=use_eagle,
+                            eagle_verified=sorted(eagle_verified),
+                            hit_block_lens=[len(blocks) for blocks in hit_blocks],
+                        )
                 if use_eagle:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -367,26 +393,55 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     del blks[num_blocks:]
 
         if debug_enabled():
+            group_block_lens = [
+                len(blocks) if blocks is not None else 0
+                for blocks in hit_blocks_by_group
+            ]
+            group_covered_lengths = [0] * num_groups
+            for spec, group_ids, _ in self.attention_groups:
+                effective_block_size = self._get_effective_block_size(spec)
+                for group_id in group_ids:
+                    blocks = hit_blocks_by_group[group_id]
+                    if blocks is not None:
+                        group_covered_lengths[group_id] = (
+                            len(blocks) * effective_block_size
+                        )
+            min_group_hit_length = (
+                min(group_covered_lengths) if group_covered_lengths else 0
+            )
+            final_over_min_by = hit_length - min_group_hit_length
+            attention_group_debug = [
+                {
+                    "spec_type": type(spec).__name__,
+                    "group_ids": group_ids,
+                    "eagle_group": idx in self.eagle_attn_group_indices,
+                }
+                for idx, (spec, group_ids, _) in enumerate(self.attention_groups)
+            ]
+            if final_over_min_by != 0:
+                debug_log(
+                    "ascend_hybrid_cache_hit_length_mismatch",
+                    coordinator_type=type(self).__name__,
+                    lookup_mode="all_groups",
+                    max_cache_hit_length=max_cache_hit_length,
+                    final_hit_length=hit_length,
+                    min_group_hit_length=min_group_hit_length,
+                    final_over_min_by=final_over_min_by,
+                    group_block_lens=group_block_lens,
+                    group_covered_lengths=group_covered_lengths,
+                    attention_groups=attention_group_debug,
+                )
             debug_log(
                 "ascend_hybrid_cache_hit_final",
                 coordinator_type=type(self).__name__,
                 lookup_mode="all_groups",
                 max_cache_hit_length=max_cache_hit_length,
                 final_hit_length=hit_length,
-                group_block_lens=[
-                    len(blocks) if blocks is not None else 0
-                    for blocks in hit_blocks_by_group
-                ],
-                attention_groups=[
-                    {
-                        "spec_type": type(spec).__name__,
-                        "group_ids": group_ids,
-                        "eagle_group": idx in self.eagle_attn_group_indices,
-                    }
-                    for idx, (spec, group_ids, _) in enumerate(
-                        self.attention_groups
-                    )
-                ],
+                min_group_hit_length=min_group_hit_length,
+                final_over_min_by=final_over_min_by,
+                group_block_lens=group_block_lens,
+                group_covered_lengths=group_covered_lengths,
+                attention_groups=attention_group_debug,
             )
         return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
 
@@ -471,6 +526,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     pcp_world_size=self.pcp_world_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * effective_block_size
+                accepted_hit_length = min(curr_hit_length, _new_hit_length)
                 if debug_enabled():
                     debug_log(
                         "ascend_hybrid_cache_hit_group",
@@ -484,12 +540,37 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         curr_hit_length_before=curr_hit_length,
                         lookup_max_length=_max_length,
                         new_hit_length=_new_hit_length,
+                        accepted_hit_length=accepted_hit_length,
+                        expanded_hit_length_by=max(
+                            0, _new_hit_length - curr_hit_length
+                        ),
                         effective_block_size=effective_block_size,
                         lcm_block_size=self.lcm_block_size,
                         drop_eagle_block=use_eagle,
                         eagle_verified=sorted(eagle_verified),
                         hit_block_lens=[len(blocks) for blocks in hit_blocks],
                     )
+                    if _new_hit_length > curr_hit_length:
+                        debug_log(
+                            "ascend_hybrid_cache_hit_length_expanded",
+                            coordinator_type=type(self).__name__,
+                            lookup_mode="per_group",
+                            group_idx=idx,
+                            group_ids=group_ids,
+                            spec_type=type(spec).__name__,
+                            max_cache_hit_length=max_cache_hit_length,
+                            input_hit_length=hit_length,
+                            curr_hit_length_before=curr_hit_length,
+                            lookup_max_length=_max_length,
+                            raw_hit_length=_new_hit_length,
+                            accepted_hit_length=accepted_hit_length,
+                            expanded_hit_length_by=_new_hit_length - curr_hit_length,
+                            effective_block_size=effective_block_size,
+                            lcm_block_size=self.lcm_block_size,
+                            drop_eagle_block=use_eagle,
+                            eagle_verified=sorted(eagle_verified),
+                            hit_block_lens=[len(blocks) for blocks in hit_blocks],
+                        )
                 if use_eagle:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
